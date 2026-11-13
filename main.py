@@ -140,6 +140,61 @@ def base_top(h):
 # ---------------------------------------------------------------- render
 
 
+# --- прекомпьют fbm-каналов на грубой сетке + билинейная интерполяция ---
+# весь шум картины низкочастотный; длинноволновым каналам хватает шага 8 px,
+# мелкому мерцанию окон нужен 4
+STEP = 8
+GW = W // STEP + 2
+GH = H // STEP + 2
+STEP_F = 4  # для мелкочастотного канала flick
+GWF = W // STEP_F + 2
+GHF = H // STEP_F + 2
+
+
+def precompute(freq_x, freq_y, octaves, k):
+    g = []
+    for gy in range(GH):
+        row = [fbm(gx * STEP * freq_x, gy * STEP * freq_y, octaves, k) for gx in range(GW)]
+        g.append(row)
+    return g
+
+
+def precompute_fine(freq_x, freq_y, octaves, k):
+    g = []
+    for gy in range(GHF):
+        row = [fbm(gx * STEP_F * freq_x, gy * STEP_F * freq_y, octaves, k) for gx in range(GWF)]
+        g.append(row)
+    return g
+
+
+def bilin(g, x, y):
+    fx = x / STEP
+    fy = y / STEP
+    x0 = int(fx)
+    y0 = int(fy)
+    tx = fx - x0
+    ty = fy - y0
+    r0 = g[y0]
+    r1 = g[y0 + 1]
+    a = r0[x0] + (r0[x0 + 1] - r0[x0]) * tx
+    b = r1[x0] + (r1[x0 + 1] - r1[x0]) * tx
+    return a + (b - a) * ty
+
+
+def bilin_f(g, x, y):
+    fx = x / STEP_F
+    fy = y / STEP_F
+    x0 = int(fx)
+    y0 = int(fy)
+    tx = fx - x0
+    ty = fy - y0
+    r0 = g[y0]
+    r1 = g[y0 + 1]
+    a = r0[x0] + (r0[x0 + 1] - r0[x0]) * tx
+    b = r1[x0] + (r1[x0 + 1] - r1[x0]) * tx
+    return a + (b - a) * ty
+
+
 def render():
     img = bytearray(W * H * 3)
 
@@ -150,6 +205,28 @@ def render():
            build_layer(202, 0, 380, 150)]
     near = [(x0, x1, 810 - h, kind, aux) for (x0, x1, h, kind, aux) in
            build_layer(303, 0, 560, 230)]
+
+    # прекомпьют силуэтов по колонкам (главный жор был здесь: поиск по
+    # списку зданий на каждый пиксель)
+    tops_f = [city_top_at(float(x), far) for x in range(W)]
+    tops_m = [city_top_at(float(x), mid) for x in range(W)]
+    tops_n = [city_top_at(float(x), near) for x in range(W)]
+    near_x0 = [-1.0] * W  # x0 здания ближнего плана в колонке (фаза окон)
+    for (x0, x1, h, kind, aux) in near:
+        xi0 = max(0, int(x0))
+        xi1 = min(W - 1, int(x1))
+        for xi in range(xi0, xi1 + 1):
+            near_x0[xi] = x0
+
+    # каналы шума: один раз на грубой сетке
+    ch_room = precompute(0.04, 0.04, 3, 21)      # фактура комнаты
+    ch_hatch = precompute(0.01, 0.01, 2, 44)     # дрожь гравюрной штриховки
+    ch_fil = precompute(0.03, 0.003, 2, 65)      # филаменты кромки расщелины
+    ch_keepf = precompute(0.01, 0.045, 3, 91)    # рассыпание дальнего плана
+    ch_keepm = precompute(0.012, 0.05, 3, 92)    # среднего
+    ch_keepn = precompute(0.014, 0.06, 3, 93)    # ближнего
+    ch_flick = precompute_fine(0.08, 0.08, 2, 12)  # мерцание окон — мелкая сетка
+    ch_fog = precompute(0.003, 0.045, 4, 71)     # рваный туман у горизонта
 
     # окно: конкретное, с вертикальной перекладиной
     FX0, FY0, FX1, FY1 = 118.0, 64.0, 906.0, 872.0
@@ -191,6 +268,15 @@ def render():
         cx_rift, t_rift = rift_x(py)
         rw = rift_w(t_rift)
 
+        # per-row: дрожь перекладины и ветви расщелины (зависят только от py)
+        mullion_x = MULLION + (fbm(py * 0.01, 6.6, 3, 13) - 0.5) * 24
+        alive = branch_alive(py)
+        if alive:
+            branch_l = branch_x(py, -1, cx_rift, rw)
+            branch_r = branch_x(py, 1, cx_rift, rw)
+            bwl = 7 + (fbm(py * 0.02, 7.7, 2, 69) - 0.5) * 6
+            bwr = 7 + (fbm(py * 0.02, 8.8, 2, 69) - 0.5) * 6
+
         for x in range(W):
             px = float(x)
 
@@ -198,22 +284,35 @@ def render():
             in_win = (px > LX and px < RX and py > TY and py < BY)
 
             # перекладина окна: грязно-серая, ловит вечер — отделена от неба тоном
-            if in_win and abs(px - (MULLION + (fbm(py * 0.01, 6.6, 3, 13) - 0.5) * 24)) < 15:
-                g = fbm(px * 0.05, py * 0.05, 3, 21)
+            if in_win and abs(px - mullion_x) < 15:
+                g = bilin(ch_room, px, py)
                 c = mix((96, 90, 96), (44, 42, 50), g)
-                _put(img, x, y, c)
+                gg = (BAYER[y & 7][x & 7] * 0.015625 - 0.5) * GRAIN
+                i3 = (y * W + x) * 3
+                v = c[0] + gg
+                img[i3] = 255 if v > 255 else (0 if v < 0 else int(v))
+                v = c[1] + gg
+                img[i3 + 1] = 255 if v > 255 else (0 if v < 0 else int(v))
+                v = c[2] + gg
+                img[i3 + 2] = 255 if v > 255 else (0 if v < 0 else int(v))
                 continue
 
             if not in_win:
                 edge = min(px - LX, RX - px, py - TY, BY - py)
-                g = fbm(px * 0.04, py * 0.04, 4, 21)
+                g = bilin(ch_room, px, py)
                 c = mix(INK, (18, 18, 26), g * 0.3)
                 if edge < 20:
                     c = mix(c, (46, 44, 54), (1 - edge / 20) * 0.6)  # кромка ловит вечер
-                rip = fbm(px * 0.006, py * 0.006, 5, 31)
-                if rip < 0.42:
-                    c = mix(c, INK, (0.42 - rip) * 4.0)
-                _put(img, x, y, c)
+                if g < 0.42:  # рваные чернильные вырывы — тот же шум, без второго fbm
+                    c = mix(c, INK, (0.42 - g) * 4.0)
+                gg = (BAYER[y & 7][x & 7] * 0.015625 - 0.5) * GRAIN
+                i3 = (y * W + x) * 3
+                v = c[0] + gg
+                img[i3] = 255 if v > 255 else (0 if v < 0 else int(v))
+                v = c[1] + gg
+                img[i3 + 1] = 255 if v > 255 else (0 if v < 0 else int(v))
+                v = c[2] + gg
+                img[i3 + 2] = 255 if v > 255 else (0 if v < 0 else int(v))
                 continue
 
             # ---- небо
@@ -224,7 +323,7 @@ def render():
                 c = mix(SKY_MID, SKY_LOW, smooth((sy - 0.52) / 0.48) * 0.92)
 
             # редкая гравюрная штриховка неба (перистая, неровная)
-            hh = sin((px * 0.55 + py * 0.83) * pi / 5.5 + fbm(px * 0.01, py * 0.01, 2, 44) * 6.0)
+            hh = sin((px * 0.55 + py * 0.83) * pi / 5.5 + bilin(ch_hatch, px, py) * 6.0)
             if hh > 0.92 and sy > 0.08 and sy < 0.75:
                 c = mix(c, (0, 0, 0), 0.12)
             # тусклые звёзды: редкие, мёртвые, гуще влево от расщелины
@@ -236,14 +335,10 @@ def render():
             # ---- расщелина мироздания
             dxr = px - cx_rift
             in_rift = abs(dxr) < rw / 2 and py < TY + (BY - TY) * 0.52
-            # ветви-микротрещины
-            if not in_rift and branch_alive(py):
-                for side in (-1, 1):
-                    bx = branch_x(py, side, cx_rift, rw)
-                    bw = 7 + (fbm(py * 0.02, 7.7, 2, 69) - 0.5) * 6
-                    if abs(px - bx) < bw / 2:
-                        in_rift = True
-                        break
+            # ветви-микротрещины (посчитаны на строку)
+            if not in_rift and alive:
+                if abs(px - branch_l) < bwl / 2 or abs(px - branch_r) < bwr / 2:
+                    in_rift = True
             if in_rift:
                 # внутри — глухая чернота + редкие мёртвые точки
                 c = (3, 3, 7)
@@ -255,7 +350,7 @@ def render():
                 dist = abs(dxr) - rw / 2
                 if dist < 70 and py < TY + (BY - TY) * 0.62:
                     fall = 1.0 - dist / 70.0
-                    ang = fbm(px * 0.03, py * 0.003, 2, 65)
+                    ang = bilin(ch_fil, px, py)
                     fil = sin(px * 1.7 + ang * 20.0)
                     if fil > 0.25:
                         c = mix(c, (4, 4, 10), 0.45 * fall)
@@ -276,12 +371,12 @@ def render():
                     hole = clamp(1.0 - (abs(px - cx_rift) - rw / 2) / 300.0, 0, 1)
                 vanish = max(drift, hole * 1.2)
 
-                top_f = city_top_at(px, far)
+                top_f = tops_f[x]
                 if top_f >= 0 and py > top_f:
                     # дальний рассыпается сильнее всех
                     keepf = 1.0
                     if vanish > 0.15:
-                        u = fbm(px * 0.01, py * 0.045, 3, 91)
+                        u = bilin(ch_keepf, px, py)
                         if u < (vanish - 0.15) * 0.9:
                             keepf = 0.0
                     if keepf:
@@ -290,47 +385,53 @@ def render():
                         if hash2(int(px // 9), int(py // 9), 66) > 0.988:
                             c = mix(c, (120, 96, 66), 0.5)
 
-                top_m = city_top_at(px, mid)
+                top_m = tops_m[x]
                 if top_m >= 0 and py > top_m:
                     keepm = 1.0
                     if vanish > 0.30:
-                        u = fbm(px * 0.012, py * 0.05, 3, 92)
+                        u = bilin(ch_keepm, px, py)
                         if u < (vanish - 0.30) * 1.1:
                             keepm = 0.0
                     if keepm:
                         c = mix(c, MID_C, 0.94)
 
-                top_n = city_top_at(px, near)
+                top_n = tops_n[x]
                 if top_n >= 0 and py > top_n:
                     keepn = 1.0
                     if vanish > 0.55:
-                        u = fbm(px * 0.014, py * 0.06, 3, 93)
+                        u = bilin(ch_keepn, px, py)
                         if u < (vanish - 0.55) * 1.3:
                             keepn = 0.0
                     if keepn:
                         c = mix(c, NEAR_C, 0.97)
                         # окна ближнего плана: крупная сетка, своя фаза по дому
-                        for (x0, x1, h, kind, aux) in near:
-                            if x0 <= px <= x1:
-                                gx = int((px - x0) // 26)
-                                gy = int(py // 34)
-                                wx = (px - x0) - gx * 26
-                                wy = py - gy * 34
-                                lit = hash2(gx + int(x0), gy, 55)
-                                # у расщелины окна гаснут — город истончается
-                                lit_thr = 0.55 + clamp(hole, 0, 1) * 0.45
-                                if 7 < wx < 20 and 9 < wy < 26 and lit > lit_thr:
-                                    flick = fbm(px * 0.08, py * 0.08, 2, 12)
-                                    c = mix(c, AMBER, 0.6 + flick * 0.25)
-                                break
+                        x0 = near_x0[x]
+                        if x0 >= 0:
+                            gx = int((px - x0) // 26)
+                            gy = int(py // 34)
+                            wx = (px - x0) - gx * 26
+                            wy = py - gy * 34
+                            lit = hash2(gx + int(x0), gy, 55)
+                            # у расщелины окна гаснут — город истончается
+                            lit_thr = 0.55 + clamp(hole, 0, 1) * 0.45
+                            if 7 < wx < 20 and 9 < wy < 26 and lit > lit_thr:
+                                flick = bilin_f(ch_flick, px, py)
+                                c = mix(c, AMBER, 0.6 + flick * 0.25)
 
             # ---- рваный туман у горизонта
             if sy > 0.55:
-                band = fbm(px * 0.003, py * 0.045, 4, 71)
+                band = bilin(ch_fog, px, py)
                 if band > 0.58:
                     c = mix(c, FOG, (band - 0.58) * 1.4 * clamp((sy - 0.55) / 0.3, 0, 1))
 
-            _put(img, x, y, c)
+            gg = (BAYER[y & 7][x & 7] * 0.015625 - 0.5) * GRAIN
+            i3 = (y * W + x) * 3
+            v = c[0] + gg
+            img[i3] = 255 if v > 255 else (0 if v < 0 else int(v))
+            v = c[1] + gg
+            img[i3 + 1] = 255 if v > 255 else (0 if v < 0 else int(v))
+            v = c[2] + gg
+            img[i3 + 2] = 255 if v > 255 else (0 if v < 0 else int(v))
 
     return img
 
@@ -373,33 +474,16 @@ def write_png(path, img):
 
     for y in range(H):
         row = img[y * stride:(y + 1) * stride]
-        best = None
-        best_sum = None
-        for f in (0, 1, 2, 3, 4):
-            out = bytearray(stride)
-            s = 0
-            for x in range(stride):
-                a = row[x - 3] if x >= 3 else 0
-                b = prev[x]
-                cc = prev[x - 3] if x >= 3 else 0
-                v = row[x]
-                if f == 1:
-                    d = (v - a) & 0xFF
-                elif f == 2:
-                    d = (v - b) & 0xFF
-                elif f == 3:
-                    d = (v - ((a + b) >> 1)) & 0xFF
-                elif f == 4:
-                    d = (v - paeth(a, b, cc)) & 0xFF
-                else:
-                    d = v
-                out[x] = d
-                s += d if d < 128 else 256 - d
-            if best_sum is None or s < best_sum:
-                best_sum = s
-                best = (f, out)
-        f, out = best
-        raw.append(f)
+        out = bytearray(stride)
+        out[0] = row[0]
+        out[1] = row[1]
+        out[2] = row[2]
+        for xx in range(3, stride):
+            a = row[xx - 3]
+            b = prev[xx]
+            cc = prev[xx - 3]
+            out[xx] = (row[xx] - paeth(a, b, cc)) & 0xFF
+        raw.append(4)  # Paeth
         raw += out
         prev = row
 
